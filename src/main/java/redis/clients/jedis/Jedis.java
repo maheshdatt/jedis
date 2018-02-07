@@ -122,6 +122,43 @@ public class Jedis extends BinaryJedis implements JedisCommands, MultiKeyCommand
   }
 
   /**
+   * interface to define the code to be executed during the blocking operation
+   */
+  private interface BlockingOperation {
+    <T> T execute();
+  }
+
+  /**
+   * This class provides a mechanism to execute blocking operations with application timeout.
+   * We set the socket timeout to a valid value in case of a valid application timeout specified.
+   */
+  private static class ClientExecutor {
+    private static final ClientExecutor clientExecutor = new ClientExecutor();
+    public <T> T executeBlockingOperationWithTimeout(Client client, BlockingOperation op, int timeout) {
+      client.setTimeoutExplicit(getSocketTimeout(timeout));
+      try {
+        return op.execute();
+      } finally {
+        client.rollbackTimeout();
+      }
+    }
+
+    private int getSocketTimeout(int timeout){
+      if(timeout <= 0){
+        return timeout;
+      }
+      // setting socket timeout to application timeout + delta so we dont race to close
+      // the socket timeout when the data is just coming back. We chose to just use the DEFAULT_TIMEOUT
+      // as delta instead of adding another config.
+      return timeout + Protocol.DEFAULT_TIMEOUT;
+    }
+
+    public static ClientExecutor get() {
+      return clientExecutor;
+    }
+  }
+
+  /**
    * Works same as <tt>ping()</tt> but returns argument message instead of <tt>PONG</tt>.
    * @param message
    * @return message
@@ -1843,7 +1880,7 @@ public class Jedis extends BinaryJedis implements JedisCommands, MultiKeyCommand
    */
   @Override
   public List<String> blpop(final int timeout, final String... keys) {
-    return blpop(getArgsAddTimeout(timeout, keys));
+    return blpopHelper(timeout, getArgsAddTimeout(timeout, keys));
   }
 
   private String[] getArgsAddTimeout(int timeout, String[] keys) {
@@ -1859,26 +1896,23 @@ public class Jedis extends BinaryJedis implements JedisCommands, MultiKeyCommand
 
   @Override
   public List<String> blpop(final String... args) {
+    return blpopHelper(0, args);
+  }
+
+  private List<String> blpopHelper(int timeout, final String... args) {
     checkIsInMultiOrPipeline();
     client.blpop(args);
-    client.setTimeoutInfinite();
-    try {
-      return client.getMultiBulkReply();
-    } finally {
-      client.rollbackTimeout();
-    }
+    return ClientExecutor.get().executeBlockingOperationWithTimeout(client, new BlockingOperation() {
+      @Override
+      public List<String> execute() {
+        return client.getMultiBulkReply();
+      }
+    }, timeout);
   }
 
   @Override
   public List<String> brpop(final String... args) {
-    checkIsInMultiOrPipeline();
-    client.brpop(args);
-    client.setTimeoutInfinite();
-    try {
-      return client.getMultiBulkReply();
-    } finally {
-      client.rollbackTimeout();
-    }
+    return brpopHelper(0, args);
   }
 
   /**
@@ -1982,7 +2016,18 @@ public class Jedis extends BinaryJedis implements JedisCommands, MultiKeyCommand
    */
   @Override
   public List<String> brpop(final int timeout, final String... keys) {
-    return brpop(getArgsAddTimeout(timeout, keys));
+    return brpopHelper(timeout, getArgsAddTimeout(timeout, keys));
+  }
+
+  private List<String> brpopHelper(final int timeout, final String... keys){
+    checkIsInMultiOrPipeline();
+    client.brpop(keys);
+    return ClientExecutor.get().executeBlockingOperationWithTimeout(client, new BlockingOperation() {
+      @Override
+      public List<String> execute() {
+        return client.getMultiBulkReply();
+      }
+    }, timeout);
   }
 
   @Override
@@ -2617,12 +2662,12 @@ public class Jedis extends BinaryJedis implements JedisCommands, MultiKeyCommand
   @Override
   public String brpoplpush(final String source, final String destination, final int timeout) {
     client.brpoplpush(source, destination, timeout);
-    client.setTimeoutInfinite();
-    try {
-      return client.getBulkReply();
-    } finally {
-      client.rollbackTimeout();
-    }
+    return ClientExecutor.get().executeBlockingOperationWithTimeout(client, new BlockingOperation() {
+      @Override
+      public String execute() {
+        return client.getBulkReply();
+      }
+    }, timeout);
   }
 
   /**
@@ -2762,23 +2807,32 @@ public class Jedis extends BinaryJedis implements JedisCommands, MultiKeyCommand
 
   @Override
   public Object eval(final String script, final int keyCount, final String... params) {
-    client.setTimeoutInfinite();
-    try {
-      client.eval(script, keyCount, params);
-      return getEvalResult();
-    } finally {
-      client.rollbackTimeout();
-    }
+    return eval(0, script, keyCount, params);
+  }
+
+  public Object eval(int timeout, final String script, final int keyCount, final String... params) {
+    return ClientExecutor.get().executeBlockingOperationWithTimeout(client, new BlockingOperation() {
+      @Override
+      public Object execute() {
+        client.eval(script, keyCount, params);
+        return getEvalResult();
+      }
+    }, timeout);
   }
 
   @Override
   public void subscribe(final JedisPubSub jedisPubSub, final String... channels) {
-    client.setTimeoutInfinite();
-    try {
-      jedisPubSub.proceed(client, channels);
-    } finally {
-      client.rollbackTimeout();
-    }
+    subscribe(0, jedisPubSub, channels);
+  }
+
+  public void subscribe(int timeout, final JedisPubSub jedisPubSub, final String... channels) {
+    ClientExecutor.get().executeBlockingOperationWithTimeout(client, new BlockingOperation() {
+      @Override
+      public Void execute() {
+        jedisPubSub.proceed(client, channels);
+        return null;
+      }
+    }, timeout);
   }
 
   @Override
@@ -2791,13 +2845,18 @@ public class Jedis extends BinaryJedis implements JedisCommands, MultiKeyCommand
 
   @Override
   public void psubscribe(final JedisPubSub jedisPubSub, final String... patterns) {
+    psubscribe(0, jedisPubSub, patterns);
+  }
+
+  public void psubscribe(int timeout, final JedisPubSub jedisPubSub, final String... patterns) {
     checkIsInMultiOrPipeline();
-    client.setTimeoutInfinite();
-    try {
-      jedisPubSub.proceedWithPatterns(client, patterns);
-    } finally {
-      client.rollbackTimeout();
-    }
+    ClientExecutor.get().executeBlockingOperationWithTimeout(client, new BlockingOperation() {
+      @Override
+      public Void execute() {
+        jedisPubSub.proceedWithPatterns(client, patterns);
+        return null;
+      }
+    }, timeout);
   }
 
   protected static String[] getParams(List<String> keys, List<String> args) {
@@ -3463,12 +3522,12 @@ public class Jedis extends BinaryJedis implements JedisCommands, MultiKeyCommand
 
   @Override
   public List<String> blpop(final int timeout, final String key) {
-    return blpop(key, String.valueOf(timeout));
+    return blpop(timeout, new String[]{key});
   }
 
   @Override
   public List<String> brpop(final int timeout, final String key) {
-    return brpop(key, String.valueOf(timeout));
+    return brpop(timeout, new String[]{key});
   }
 
   @Override
@@ -3578,5 +3637,4 @@ public class Jedis extends BinaryJedis implements JedisCommands, MultiKeyCommand
     client.hstrlen(key, field);
     return client.getIntegerReply();
   }
-
 }
