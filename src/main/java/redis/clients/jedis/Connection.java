@@ -5,6 +5,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -88,11 +89,19 @@ public class Connection implements Closeable {
   }
 
   public void setTimeoutInfinite() {
+    setTimeoutExplicit(0);
+  }
+
+  /**
+   * overrides the socket timeout to the specified value
+   * @param socketTimeout socket timeout to be set
+   */
+  public void setTimeoutExplicit(int socketTimeout){
     try {
       if (!isConnected()) {
         connect();
       }
-      socket.setSoTimeout(0);
+      socket.setSoTimeout(socketTimeout);
     } catch (SocketException ex) {
       broken = true;
       throw new JedisConnectionException(ex);
@@ -261,7 +270,16 @@ public class Connection implements Closeable {
   }
 
   public List<String> getMultiBulkReply() {
-    return BuilderFactory.STRING_LIST.build(getBinaryMultiBulkReply());
+    try {
+      return BuilderFactory.STRING_LIST.build(getBinaryMultiBulkReply());
+    } catch (Exception e){
+      // in case we timeout waiting for the socket, its safer to close the underlying socket
+      // since we won't know if the remote end is still connected.
+      if (e.getCause() != null && e.getCause() instanceof SocketTimeoutException){
+        close();
+      }
+      throw e;
+    }
   }
 
   @SuppressWarnings("unchecked")
